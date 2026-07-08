@@ -270,6 +270,295 @@ Gateway/多代理场景下，中断可以级联传播：
 
 ---
 
+## Q3: 迭代预算与宽限调用（Iteration Budget + Grace Call）
+
+### 为什么需要迭代预算？
+
+ReAct循环理论上可以无限运行——模型一直返回工具调用，一直执行，永远不结束。为了防止死循环和成本失控，Hermes引入了**IterationBudget**（迭代预算）。
+
+### 核心实现
+
+`agent/iteration_budget.py` + `agent/conversation_loop.py#L604-L628`：
+
+```python
+# 主循环条件
+while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) 
+       or agent._budget_grace_call:
+    # ...
+
+    # 宽限调用逻辑
+    if agent._budget_grace_call:
+        agent._budget_grace_call = False  # 消费宽限标志，这轮后就退出
+    elif not agent.iteration_budget.consume():
+        _turn_exit_reason = "budget_exhausted"
+        agent._safe_print(
+            f"\n⚠️  Iteration budget exhausted "
+            f"({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)"
+        )
+        break
+```
+
+### 默认配置
+- 默认 `max_iterations = 8`（8次LLM API调用/回合）
+- 这个数字是经验值：大部分任务在5-6次迭代内完成，8次足够处理复杂任务，又防止无限循环
+- 用户可以通过配置调整
+
+### 宽限调用（Grace Call）是什么？
+
+预算耗尽时不是立即退出，而是给模型**最后一次机会**生成最终回复：
+- `agent._budget_grace_call = True` → 允许再多一次LLM调用
+- 这一次调用专门给模型生成总结/部分结果，而不是继续工具调用
+- 防止刚好在工具调用完时预算耗尽，模型没有机会回复用户
+- 如果宽限调用里模型又返回工具调用，预算真的耗尽，退出
+
+---
+
+## Q4: 多层错误恢复与重试机制
+
+Hermes的错误恢复不是简单的"重试3次"，而是针对不同错误类型有专门的恢复策略，共**7层恢复机制**：
+
+| 错误类型 | 检测方式 | 恢复策略 | 重试次数 |
+|---------|---------|---------|---------|
+| 1. 限流/5xx错误 | HTTP 429/500/503 | 自适应退避重试 + 抖动(jitter) | 默认5次 |
+| 2. 网络中断（流中途断了） | PARTIAL_STREAM_STUB_ID | 续传提示词，继续生成 | 最多3次 |
+| 3. 输出截断（finish_reason=length） | finish_reason == "length" | 追加"continue"提示，继续生成 | 文本截断3次；工具截断3次 |
+| 4. 工具调用JSON截断 | finish_reason=length 且有tool_calls | 增加max_tokens重跑同一请求 | 3次，每次翻倍max_tokens |
+| 5. 空响应（模型什么都没返回） | content=None/""且无tool_calls | 分情况恢复：部分流恢复→上轮内容回退→nudge提示→thinking预填充→空响应重试 | 3次 |
+| 6. 思考预算耗尽（全在想没输出） | 有<think>块但后面无可见内容 | 直接返回用户友好提示，降低思考努力/换模型 | 不重试，直接退出 |
+| 7. 主provider失败 | API错误/限流/额度耗尽 | 自动激活fallback provider链，重试计数重置 | fallback链长度 |
+
+### 详细恢复逻辑
+
+#### 4.1 自适应限流退避
+
+`agent/retry_utils.py`：
+```python
+while retry_count < max_retries:
+    try:
+        response = call_api()
+        break
+    except RateLimitError:
+        backoff = adaptive_rate_limit_backoff(retry_count)
+        # 不一次性sleep完，每200ms检查一次中断
+        for _ in range(int(backoff / 0.2)):
+            if agent._interrupt_requested:
+                return interrupted_response
+            time.sleep(0.2)
+        retry_count += 1
+```
+退避时间随重试次数指数增加，加随机抖动防止惊群效应。
+
+#### 4.2 工具调用截断恢复（非常巧妙）
+
+`conversation_loop.py#L1754-L1791`：
+- 检测到tool_calls被截断（JSON不完整）
+- **不把坏消息加入历史**（会污染上下文）
+- 每次重试**翻倍max_tokens**，给模型更多空间写完JSON
+- 第一次4096 → 第二次8192 → 第三次16384（上限32768）
+- 重试3次还不行就报错告诉用户
+
+```python
+if truncated_tool_call_retries < 3:
+    truncated_tool_call_retries += 1
+    # Boost max_tokens on each retry
+    _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
+    _tc_boost = _tc_boost_base * (truncated_tool_call_retries + 1)
+    agent._ephemeral_max_output_tokens = min(_tc_boost, 32768)
+    continue  # 重跑同一个API调用，不追加坏消息
+```
+
+#### 4.3 空响应恢复（4层递进）
+
+模型返回空内容（content=None且无tool_calls）时，按优先级尝试4种恢复：
+
+```
+空响应
+  ↓
+1. 部分流恢复？→ 如果已经流式输出了部分内容给用户，直接用已输出的
+  ↓ 否
+2. 上一轮内容回退？→ 上一轮全是housekeeping工具（memory/todo）+ 有文本内容，用那个
+  ↓ 否
+3. 工具后nudge？→ 最近5条有tool消息，加提示"请处理工具结果继续任务"
+  ↓ 否/重试过
+4. Thinking预填充？→ 模型有思考块但没输出，把思考块加入历史继续（prefill）
+  ↓ 否/重试2次
+5. 空响应重试？→ 重新调用API
+  ↓ 3次都空
+6. 激活fallback provider
+```
+
+**nudge提示词**（conversation_loop.py#L4449-L4457）：
+```python
+messages.append({
+    "role": "user",
+    "content": "You just executed tool calls but returned an empty response. "
+               "Please process the tool results above and continue with the task.",
+    "_empty_recovery_synthetic": True,
+})
+```
+注意：追加空assistant消息"(empty)"保证消息序列合法（tool→assistant→user，不能直接tool→user）。
+
+#### 4.4 思考预算耗尽（Thinking Budget Exhausted）
+
+`conversation_loop.py#L1632-L1691`：
+- 检测：模型返回了<think>块，但<think>后面**完全没有可见内容**（finish_reason=length）
+- 说明模型把所有输出token都花在思考上了，根本没开始回答
+- 这种情况继续续传也没用，直接返回用户友好提示：
+  ```
+  ⚠️ Thinking Budget Exhausted
+  
+  The model used all its output tokens on reasoning and had none left for the actual response.
+  
+  To fix this:
+  → Lower reasoning effort: `/thinkon low` or `/thinkon minimal`
+  → Or switch to a larger/non-reasoning model with `/model`
+  ```
+
+---
+
+## Q5: Fallback Provider链（自动故障转移）
+
+### 为什么需要Fallback？
+
+单个API provider可能出现：额度耗尽、限流、宕机、地区不可用、模型下线等问题。Fallback链让Hermes自动切换到备用provider，用户无感知。
+
+### 核心实现
+
+`agent/fallback_manager.py` + `conversation_loop.py#L1006-L1013`：
+```python
+if is_rate_limited_or_error:
+    nous_remaining = nous_rate_limit_remaining()
+    if nous_remaining <= 0:
+        f"⏳ {nous_msg} Trying fallback..."
+        if agent._try_activate_fallback():
+            # 激活fallback成功：重置所有重试计数
+            retry_count = 0
+            compression_attempts = 0
+            _retry.primary_recovery_attempted = False
+            # rewrite模型身份行，恢复prefix cache字节同一性
+            rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
+```
+
+### Fallback关键设计
+1. **重试计数重置**：切换到新provider后从头开始重试，新provider有完整机会
+2. **字节同一性恢复**：`rewrite_prompt_model_identity()` 把prompt中的`Model:/Provider:`行改回原始值，保证prefix cache继续命中
+3. **凭证池轮换**：同provider多个API key自动轮换，耗尽了再切下一个provider
+4. **可以配置多个fallback**：比如 主Anthropic → 备用OpenRouter → 再备用本地Ollama
+
+---
+
+## Q6: 消息卫生（Message Sanitization）
+
+在发给API之前，Hermes会做**多层消息清洗和修复**，保证消息格式100%合法，防止API报错：
+
+`conversation_loop.py#L722-L876`：
+
+| 清理操作 | 目的 |
+|---------|------|
+| **工具参数修复** `_sanitize_tool_call_arguments()` | 修复模型生成的不合法JSON（缺逗号、引号不闭合等） |
+| **孤儿工具结果清理** `_sanitize_api_messages()` | 删掉没有对应tool_call的tool结果，补全缺失的tool结果占位符 |
+| **纯思考回合丢弃** `_drop_thinking_only_and_merge_users()` | 删掉只有thinking没有内容/tool_calls的assistant消息，合并相邻user消息 |
+| **Surrogate字符清理** `_sanitize_messages_surrogates()` | 清理Unicode代理对，防止OpenAI SDK报错 |
+| **非ASCII清理** `_sanitize_messages_non_ascii()` | 某些provider不支持的特殊字符处理 |
+| **Strict API工具清理** `_sanitize_tool_calls_for_strict_api()` | 严格模式下工具参数额外清洗 |
+| **内部标记剥离** `api_msg.pop("_thinking_prefill", None)` | 剥离内部标记，不发给API |
+
+### 孤儿工具结果问题
+
+什么是孤儿？
+- **孤立tool结果**：有tool消息，但找不到对应的assistant tool_call → 删掉
+- **缺失tool结果**：有assistant tool_call，但没有对应的tool结果 → 补一个占位符结果：
+  ```
+  [System: Tool result missing — the stream timed out before it could be delivered. 
+  Do NOT retry the same tool call. Continue.]
+  ```
+这防止了：
+- 会话从磁盘加载时消息不完整
+- 流中断导致tool_call/result不配对
+- 模型生成非法消息序列导致API 400错误
+
+---
+
+## Q7: 上下文压缩（Context Compression）
+
+当对话历史太长接近上下文窗口限制时，Hermes自动压缩旧消息：
+
+`conversation_loop.py#L4300-L4328`：
+
+```python
+_real_tokens = estimate_request_tokens_rough(messages, tools=agent.tools or None)
+if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+    agent._safe_print("  ⟳ compacting context…")
+    messages, active_system_prompt = agent._compress_context(
+        messages, system_message,
+        approx_tokens=agent.context_compressor.last_prompt_tokens,
+        task_id=effective_task_id,
+    )
+    # 压缩后创建新session，旧的归档
+    conversation_history = None
+```
+
+### 压缩时机
+- 主压缩器：上下文窗口 **50%** 时触发（提前压缩，给后续消息留空间）
+- Gateway卫生安全网：**85%** 时触发兜底压缩
+- 压缩不是一次性压完，而是渐进式，保持最近N轮消息原文，旧消息摘要
+
+### 压缩后处理
+1. **invalidate_system_prompt()**：清空缓存的system prompt，重新构建（reload memory）
+2. **创建新session**：压缩后的消息写入新session，旧session归档保留
+3. **Prefix Cache恢复**：system prompt重建后stable部分仍然字节稳定，缓存1-2轮内恢复命中
+4. **压缩消息保护**：前3条非系统消息、后6条消息不压缩，保护开场指令和最近上下文
+
+---
+
+## Q8: 预飞压缩（Pre-flight Compression）
+
+回合开始前先估算token数，超阈值就先压缩再开始LLM调用——而不是等到API报错再处理。
+
+回合初始化时（conversation_loop.py）：
+1. 估算当前messages+tools的总token数（含工具schema，工具多的时候能加20-30k token）
+2. 如果超过压缩阈值，先做preflight compression
+3. 然后才开始构建api_messages和LLM调用
+
+---
+
+## Q9: 思考Spinner（等待动画）
+
+`conversation_loop.py#L952-L964`：
+
+模型"思考"时显示可爱的动画，让用户知道Agent在工作：
+
+```python
+if not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
+    face = random.choice(KawaiiSpinner.get_thinking_faces())
+    verb = random.choice(KawaiiSpinner.get_thinking_verbs())
+    thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=agent._print_fn)
+    thinking_spinner.start()
+```
+
+- 有流式输出时不显示spinner（用户直接看到token输出）
+- 非流式/安静模式下显示spinner
+- 随机选择表情（🤔💭⭐🌟等）和动词（thinking, pondering, processing等）
+- 收到第一个token时spinner自动停止
+
+---
+
+## Q10: 增量会话持久化
+
+`conversation_loop.py#L4324-L4325`：
+
+```python
+# Save session log incrementally (so progress is visible even if interrupted)
+agent._session_messages = messages
+```
+
+不是回合结束才保存会话，而是每次工具执行完/LLM调用后就增量保存：
+- 如果进程崩溃/被kill，之前的对话不会丢失
+- 恢复时从最后保存点继续
+- 后台review等fork也能看到最新消息
+
+---
+
 ## 关键源码位置
 
 | 概念 | 文件位置 |

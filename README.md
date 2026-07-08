@@ -30,4 +30,5 @@ learning-hermes/
 - 三层记忆架构 + MemoryManager编排器 + Fire-and-Forget异步后台
 - Turn回合边界与生命周期
 - MCP协议支持（Stdio/Streamable HTTP/SSE三种传输）
+- Prompt Caching前缀缓存（字节级冻结 + cache_control断点，降低75%成本）
 - 大模型量化论文分类（10个方向）
