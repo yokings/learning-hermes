@@ -32,28 +32,38 @@
 比如你让Hermes解决了一个复杂问题："帮我把项目部署到Vercel，配置自定义域名和HTTPS，解决了CORS问题"。
 
 Agent做完后，如果判断这是个可复用的流程，会自己：
-```
-1. 调用 skill_manage(action="create",
-      name="vercel-deploy-custom-domain",
-      description="部署Vercel项目+配置自定义域名+HTTPS+CORS问题解决SOP",
-      content="""# Vercel自定义域名部署完整SOP
+
+```python
+# 1. 调用 skill_manage 创建新Skill
+skill_manage(
+    action="create",
+    name="vercel-deploy-custom-domain",
+    description="部署Vercel项目+配置自定义域名+HTTPS+CORS问题解决SOP",
+    content="""# Vercel自定义域名部署完整SOP
 ## 前置准备
 - 域名已经在阿里云/Cloudflare解析
 - Vercel项目已经push到GitHub
+
 ## 步骤
 1. 在Vercel项目Settings→Domains添加你的域名
 2. 按提示去域名服务商添加CNAME记录
 ...
+
 ## CORS问题解决
 如果遇到跨域错误，在vercel.json添加headers配置：
-```json
-...
-```
+
+    {
+      "headers": [
+        { "source": "/api/(.*)", "headers": [{"key": "Access-Control-Allow-Origin", "value": "*"}] }
+      ]
+    }
 """)
-2. 返回给用户："我已经把这次部署完整流程沉淀成了`vercel-deploy-custom-domain` skill，下次部署直接调用这个skill就行，不用再重新查文档踩坑了。"
+
+# 2. 返回给用户："我已经把这次部署完整流程沉淀成了`vercel-deploy-custom-domain` skill，下次部署直接调用这个skill就行，不用再重新查文档踩坑了。"
 ```
 
 下次你再说"帮我部署另一个项目到Vercel，配置自定义域名"，模型直接：
+
 ```
 调用 skill_view(name="vercel-deploy-custom-domain")
 → 直接拿到完整SOP
