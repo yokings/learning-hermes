@@ -957,6 +957,121 @@ Hermes自动从类型注解和docstring生成完整schema。
 
 ---
 
+## Q6: 什么是Function Calling？——LLM"动手做事"的基础
+
+Function Calling（函数调用）是LLM的一项原生能力：模型不再只是输出文本给用户看，而是可以输出**结构化的"调用某个工具/函数"请求**，由外部程序执行后把结果返回给模型，模型再继续推理给出最终回答。
+
+它是所有AI Agent能做事的基础——没有Function Calling，模型只能"纸上谈兵"；有了它，模型才能读文件、写代码、搜索网页、执行命令、调用API，真正和真实世界交互。
+
+### 在Function Calling出现之前（靠正则解析，很不可靠）
+
+最早（2023年之前）让LLM调用工具，是靠prompt工程让模型把函数调用输出成特定格式文本，然后用正则解析：
+```
+用户：北京今天天气怎么样？
+模型输出：
+我需要查一下天气。
+<|FunctionCallBegin|>[{"name":"get_weather","parameters":{"city":"北京"}}]<|FunctionCallEnd|>
+```
+问题非常多：
+- ❌ 模型经常格式写错：少括号、引号不匹配、参数名拼错、漏必填字段
+- ❌ 有时候不按要求格式输出，直接说"我需要调用天气工具"但不输出标记
+- ❌ 需要写大量容错解析代码，还经常解析失败
+- ❌ 准确率只有60-70%，复杂多工具调用更糟
+
+### Function Calling原生支持（API层约束+专门微调）
+
+2023年6月OpenAI在GPT-4/GPT-3.5里原生支持Function Calling，之后所有主流模型跟进，本质变化是：
+1. 你把可用工具的JSON Schema（参数说明书）直接通过API传给模型
+2. 模型经过专门微调，被明确约束只能输出符合schema的工具调用结构
+3. API返回的不是纯文本，而是结构化的`tool_calls`字段，不需要正则解析！
+4. 工具调用准确率直接提升到95%+，复杂并行调用也基本不会错
+
+### 完整工作流程（天气例子）
+
+```
+1. 你传给API：
+   - 用户消息："北京今天天气怎么样？适合出门吗？"
+   - tools参数：[get_weather...] 每个工具带JSON Schema
+
+2. LLM思考："用户问天气，我需要调用get_weather"
+   → 返回结构化tool_calls：
+     [{"id": "call_abc123", "type": "function",
+       "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}}]
+   → arguments是合法JSON字符串，不需要你解析格式
+
+3. 你的代码：
+   - 找到get_weather函数，解析参数
+   - 执行get_weather("北京") → 拿到结果：{温度、天气、风力...}
+
+4. 把工具结果作为role:tool消息传回API：
+   {"role": "tool", "tool_call_id": "call_abc123",
+    "name": "get_weather", "content": "{...结果...}"}
+
+5. LLM看到结果，输出最终回答给用户：
+   "北京今天晴天，28度，微风，空气质量优，非常适合出门~"
+```
+
+### 支持的核心特性
+
+| 特性 | 说明 |
+|------|------|
+| **并行调用** | 模型一次返回多个tool_calls，你可以同时执行（Hermes ToolExecutor自动支持） |
+| **tool_choice控制** | `auto`模型自己决定；`required`强制必须调用；`none`禁用；指定函数名强制调用某个 |
+| **多轮调用链** | 可以连续多轮调用工具：调用A→结果返回→调用B→结果返回→...→最终回答，这就是ReAct循环 |
+
+### 在Hermes里的实现
+
+Hermes整个对话主循环就是基于Function Calling运转的，伪代码：
+```python
+while True:
+    # 1. 发消息+所有工具schema给LLM
+    response = llm.chat(messages=messages, tools=registry.get_definitions())
+    message = response.choices[0].message
+    messages.append(message)
+    
+    if not message.tool_calls:
+        # 2. 没有tool_calls → 最终回复给用户，turn结束
+        yield message.content
+        break
+    
+    # 3. 有tool_calls → 分发执行所有工具
+    for tc in message.tool_calls:
+        result = registry.dispatch(tc.function.name, json.loads(tc.function.arguments))
+        messages.append(make_tool_result_message(result, tc.id))
+    # 循环继续，把结果喂回LLM
+```
+这就是我们02笔记讲的ReAct Loop的核心。
+
+### 不同模型的格式差异由适配器统一处理
+
+| 厂商 | 格式特点 | Hermes处理方式 |
+|------|---------|--------------|
+| OpenAI GPT | 标准`tool_calls[]`数组，role:assistant消息 | 直接用 |
+| Anthropic Claude | content数组里的`tool_use`块，id在`tool_use_id` | 适配器自动转换 |
+| Google Gemini | 自家格式 | 适配器自动转换 |
+| 开源模型(Llama3/Qwen) | 大多兼容OpenAI格式，部分用prompt模板 | 传输层统一适配 |
+对上层对话循环和ToolExecutor完全透明，换模型不用改核心逻辑。
+
+### JSON Schema和Function Calling的关系
+
+- **JSON Schema**：是工具的"参数说明书"，描述工具需要什么参数、什么类型
+- **Function Calling**：是模型"看了说明书后，生成合法调用请求的原生能力"
+两者配合：schema是契约，Function Calling是遵守契约输出结构化结果的能力，共同让工具调用稳定可靠。
+
+### 常见失败模式（即使原生支持也会有）
+
+| 失败类型 | 说明 | Hermes如何处理 |
+|---------|------|--------------|
+| 参数幻觉 | 传不存在的参数名或错类型 | API层校验+消息卫生修复 |
+| 过度调用 | 不需要调用时也调用/重复调用 | Guardrails死循环检测 |
+| 工具选择错误 | 应该用read_file用了web_fetch | 靠工具描述清晰+模型能力提升 |
+| 参数值错误 | 用户说上海传成北京 | 模型理解问题，靠更好的system prompt |
+| tool_call_id不匹配 | 返回结果id写错 | 消息卫生层自动修复 |
+
+**一句话总结**：Function Calling是LLM原生支持的结构化输出能力——你给模型工具说明书（JSON Schema），模型决定要不要调用、调用哪个、传什么参数，输出结构化调用请求，你执行完返回结果继续推理。这就是AI Agent从"光说不练"到"真正做事"的基础。
+
+---
+
 ## 关键源码位置
 
 | 概念 | 文件位置 |
@@ -984,3 +1099,4 @@ Hermes自动从类型注解和docstring生成完整schema。
 | MCP客户端/动态注册 | `tools/mcp_tool.py` |
 | Skills Hub技能市场 | `tools/skills_hub.py` |
 | Skills安全扫描 | `tools/skills_guard.py` / `tools/skills_ast_audit.py` |
+| **JSON Schema自动推断** | **`tools/registry.py`** (_infer_schema_from_function，从类型注解/docstring生成) |
