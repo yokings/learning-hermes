@@ -30,6 +30,7 @@ learning-hermes/
 - Guardrails 输入输出安全门
 - 三层记忆架构 + MemoryManager编排器 + Fire-and-Forget异步后台
 - Turn回合边界与生命周期
+- **架构选型：Tool vs Skill vs Subagent 决策指南**
 - MCP协议支持（Stdio/Streamable HTTP/SSE三种传输）
 - Prompt Caching前缀缓存（字节级冻结 + cache_control断点，降低75%成本）
 - 大模型量化论文分类（10个方向）
