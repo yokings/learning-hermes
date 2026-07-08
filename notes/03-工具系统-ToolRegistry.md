@@ -801,6 +801,162 @@ def register(ctx):
 
 ---
 
+## Q5: 什么是JSON Schema？——给模型看的工具参数说明书
+
+JSON Schema是用来描述JSON数据结构的"说明书"。在LLM工具调用里，它就是**给模型看的"函数参数说明书"**——模型靠它知道：调用这个工具需要传什么参数、每个参数是什么类型、哪些是必填的、有什么取值范围。
+
+### 最简单的例子
+
+比如有个函数：
+```python
+def create_file(filename: str, content: str, overwrite: bool = False):
+    ...
+```
+
+对应的JSON Schema：
+```json
+{
+  "type": "object",
+  "properties": {
+    "filename": {
+      "type": "string",
+      "description": "Path to the file to create"
+    },
+    "content": {
+      "type": "string",
+      "description": "Content to write to the file"
+    },
+    "overwrite": {
+      "type": "boolean",
+      "description": "Whether to overwrite if file exists",
+      "default": false
+    }
+  },
+  "required": ["filename", "content"]
+}
+```
+
+模型看到这个schema就知道：
+- 这是个object，有三个字段
+- `filename`是字符串，必填
+- `content`是字符串，必填
+- `overwrite`是布尔值，可选，默认false
+- 然后它就会按照这个结构生成正确的参数JSON，不会传错类型、不会漏必填参数
+
+### 核心字段说明
+
+| 字段 | 作用 | 例子 |
+|------|------|------|
+| `type` | 数据类型 | `string`/`number`/`integer`/`boolean`/`array`/`object` |
+| `properties` | 对象的字段定义（每个字段自己也是个schema） | `{"name": {"type": "string"}}` |
+| `required` | 必填字段列表 | `["filename", "content"]` |
+| `description` | 字段/函数的自然语言描述 | 模型靠这个理解参数是什么意思 |
+| `default` | 默认值（可选字段不填时用） | `false` |
+| `enum` | 枚举：只能是这几个值之一 | `["low", "medium", "high"]` |
+| `items` | 数组元素的schema | `{"type": "string"}` 表示字符串数组 |
+| `minimum`/`maximum` | 数字范围 | `0` 到 `100` |
+| `minLength`/`maxLength` | 字符串长度限制 | 最少1个字符，最多1000 |
+
+### 为什么JSON Schema很重要？
+
+在没有Function Calling/JSON Schema之前：
+- 你告诉模型"如果要读文件，输出 ```tool_call: read_file, path: xxx``` 这样的格式"
+- 模型经常写错：漏参数、参数类型错、格式错、多输出无关内容
+- 你需要写一堆解析代码去容错，还是经常崩
+
+有了JSON Schema + Function Calling后：
+- API本身就会检查模型生成的参数是否符合schema，不符合直接内部修正/报错
+- 模型被明确约束，工具调用准确率从60-70%提升到95%+
+- 不需要自己写复杂的解析容错代码
+
+### Hermes中schema的两种生成方式
+
+1. **自动推断（推荐）**：用`@tool()`装饰器时，如果没传schema，Hermes会从函数签名、类型注解、docstring自动生成JSON Schema——你完全不用手写
+
+```python
+@tool(emoji="📝")
+def write_file(filename: str, content: str, overwrite: bool = False) -> str:
+    """Write content to a file.
+    
+    Args:
+        filename: Path to the file
+        content: Content to write
+        overwrite: Overwrite existing file? Default false.
+    """
+    ...
+```
+Hermes自动从类型注解和docstring生成完整schema。
+
+2. **手动定义**：复杂的工具可以手动写schema传进`@tool(schema=...)`
+
+### 最终传给LLM的格式
+
+所有工具的schema最终拼成一个数组，发给OpenAI/Anthropic等API：
+```json
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write content to a file",
+        "parameters": { /* JSON Schema在这里 */ }
+      }
+    },
+    {
+      "type": "function",
+      "function": { "name": "read_file", ... }
+    }
+  ]
+}
+```
+模型看到这个，就知道有哪些工具、每个怎么调用。
+
+### 更复杂的例子（数组+嵌套对象+枚举）
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Search query string"
+    },
+    "max_results": {
+      "type": "integer",
+      "description": "Max number of results to return",
+      "minimum": 1,
+      "maximum": 20,
+      "default": 10
+    },
+    "filters": {
+      "type": "object",
+      "description": "Optional filters",
+      "properties": {
+        "file_types": {
+          "type": "array",
+          "description": "File extensions to include",
+          "items": { "type": "string", "enum": ["py", "js", "md", "ts"] }
+        },
+        "date_range": {
+          "type": "string",
+          "enum": ["day", "week", "month", "year", "all"]
+        }
+      }
+    }
+  },
+  "required": ["query"]
+}
+```
+模型看到这个就知道：
+- `query`必填，字符串
+- `max_results`可选，整数，1-20，默认10
+- `filters`可选，里面`file_types`是数组，元素只能是py/js/md/ts这几个值；`date_range`是枚举
+
+**一句话总结**：JSON Schema就是给LLM看的"函数参数说明书"，模型靠它知道工具需要什么参数、什么类型、哪些必填，保证工具调用的准确率。在Hermes里，每个工具都要有一个JSON Schema，要么自动从函数签名生成，要么手动定义。
+
+---
+
 ## 关键源码位置
 
 | 概念 | 文件位置 |
@@ -820,3 +976,11 @@ def register(ctx):
 | **工具结果统一构造/不可信包装** | **`agent/tool_dispatch_helpers.py`** (make_tool_result_message, _maybe_wrap_untrusted) |
 | 大结果持久化 | `tools/tool_result_storage.py` |
 | Provider格式适配（OpenAI/Anthropic） | `agent/transports/chat_completions.py` / `agent/anthropic_adapter.py` |
+| **Python插件管理器** | **`hermes_cli/plugins.py`** |
+| 插件CLI命令 | `hermes_cli/plugins_cmd.py` |
+| 插件工具API | `plugins/plugin_utils.py` (PluginContext) |
+| MCP目录/安装 | `hermes_cli/mcp_catalog.py` / `hermes_cli/mcp_config.py` |
+| MCP安全校验 | `hermes_cli/mcp_security.py` |
+| MCP客户端/动态注册 | `tools/mcp_tool.py` |
+| Skills Hub技能市场 | `tools/skills_hub.py` |
+| Skills安全扫描 | `tools/skills_guard.py` / `tools/skills_ast_audit.py` |
