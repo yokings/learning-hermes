@@ -581,6 +581,226 @@ messages.append(tool_result_message) → 加入对话历史
 
 ---
 
+## Q4: 如何扩展工具？四种扩展方式与ToolRegistry的关系统一
+
+Hermes支持四种扩展方式，但**不管工具从哪来，最终都统一汇入全局ToolRegistry**——主agent看到的是一个统一工具列表，完全不关心来源。
+
+### 整体架构关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         工具来源层                                    │
+├─────────────┬─────────────┬─────────────┬───────────────────────────┤
+│ 内置工具    │ MCP服务器   │ Python插件  │ Skills技能                 │
+│ (tools/*.py)│ (stdio/HTTP)│ (plugins/)  │ (不提供工具，只注入知识)   │
+│ read_file   │ github      │ spotify     │ 只是Markdown文档          │
+│ terminal    │ postgres    │ my-custom   │ 模型读了后调用其他工具     │
+│ web_search  │ filesystem  │ ...         │                           │
+└──────┬──────┴──────┬──────┴──────┬──────┘                           │
+       │             │             │                                   │
+       │             │             │                                   │
+       ▼             ▼             ▼                                   │
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ToolRegistry（中央工具总线）                       │
+│               线程安全单例，统一存储所有工具                           │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  ToolEntry: name, schema, handler, toolset, check_fn, ...   │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               │ get_definitions() 动态生成schema
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       主agent (LLM)                                 │
+│              只看到一个统一的工具列表，完全不关心来源                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 四种扩展方式对比
+
+| 扩展方式 | 安装命令 | 是否提供工具 | 注册方式 | handler是什么 | 还能做什么 | 安全级别 |
+|---------|---------|-------------|---------|--------------|-----------|---------|
+| **内置工具** | 随Hermes发布 | ✅ | AST扫描→@tool装饰器自注册 | 本地Python函数 | - | 最高 |
+| **MCP服务器（推荐）** | `hermes mcp install <name>` | ✅ | 连接时动态register，断开deregister | MCP协议封装（发JSON-RPC到子进程/HTTP） | 只能提供工具/resources/prompts | 官方目录审核+命令检测 |
+| **Python插件** | `hermes plugins install <owner/repo>` | ✅（可选） | `ctx.register_tool()` → 调用registry.register | 插件里的Python函数 | 注册hooks/CLI命令/Provider/平台适配器等 | opt-in需显式启用 |
+| **Skills技能** | `hermes skills install <name>` | ❌ **不注册工具** | - | - | 注入知识/SOP/模板，模型读了调用其他工具 | AST审计+隔离扫描 |
+
+---
+
+### 1. 内置工具：启动时AST扫描自注册
+
+`discover_builtin_tools()`：
+- AST静态扫描 `tools/*.py` 找 `@tool()` 装饰器
+- import模块触发装饰器执行 → `registry.register()`
+- 不需要手动配置，开箱即用
+
+---
+
+### 2. MCP服务器：连接后动态注册/注销
+
+MCP是Model Context Protocol标准协议，生态最丰富：
+
+```
+1. 配置写入config.yaml
+2. 启动时连接MCP服务器
+3. 调用tools/list获取远端工具列表
+4. 对每个工具 → registry.register()
+   - schema：MCP schema转换为OpenAI function schema
+   - handler：封装成函数，调用时发JSON-RPC给MCP服务器
+5. MCP断开 → registry.deregister()
+6. _generation版本号+1 → 缓存自动失效，下一轮模型看到工具列表变化
+```
+
+安装方式：
+```bash
+hermes mcp catalog          # 浏览官方精选目录
+hermes mcp install github   # 从官方目录安装
+hermes mcp add my-server --url https://...  # 手动添加
+```
+
+配置写入 `~/.hermes/config.yaml`：
+```yaml
+mcp_servers:
+  github:
+    enabled: true
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+    tools:
+      include: ["create_issue", "list_repos"]  # 只启用需要的工具
+```
+
+---
+
+### 3. Python插件：深度扩展，不止加工具
+
+插件不仅能加工具，还能扩展Hermes的核心能力：
+
+```python
+# 插件 __init__.py
+def register(ctx):
+    # 注册工具
+    @ctx.register_tool(emoji="👋")
+    def my_greet(name: str) -> str:
+        """Greet someone."""
+        return f"Hello {name}!"
+    
+    # 还能注册：
+    ctx.register_hook("post_tool_call", my_hook)       # 生命周期钩子
+    ctx.register_cli_command("mycmd", my_cli_handler) # hermes mycmd CLI命令
+    ctx.register_command("/mycmd", my_slash_handler)  # 会话内斜杠命令
+    ctx.register_web_search_provider(...)             # 替换搜索后端
+    ctx.register_image_gen_provider(...)              # 替换图片生成后端
+```
+
+四级插件加载优先级（后者覆盖前者）：
+1. 捆绑插件（随Hermes发布在 `plugins/`）
+2. 用户插件（`~/.hermes/plugins/`）
+3. 项目插件（`./.hermes/plugins/`，需显式开启）
+4. pip entry point包（`hermes_agent.plugins`）
+
+安装：
+```bash
+hermes plugins install owner/repo  # 从GitHub安装
+hermes plugins enable spotify
+hermes plugins list
+```
+
+**安全**：插件默认opt-in，必须显式启用才加载；安全模式 `HERMES_SAFE_MODE=1` 完全跳过插件加载。
+
+---
+
+### 4. Skills技能：不提供工具，只提供知识
+
+Skill **不注册任何可执行工具**——它只是Markdown文档：
+- 主agent通过内置工具 `skill_view(name)` 读取SKILL.md内容
+- 模型读完"操作手册"后，**调用ToolRegistry里已有的其他工具**完成工作
+- 相当于给模型一本SOP手册，而不是给它一只新手
+
+安装最安全，不执行任何代码：
+```bash
+hermes skills search "code review"
+hermes skills install react-expert
+```
+安装经过隔离扫描→风险检测→用户确认流水线，第三方技能默认显示黄色免责声明。
+
+---
+
+### 统一执行流程：不关心来源，dispatch一致
+
+不管工具来自哪里，执行流程完全一样：
+
+```
+主agent返回tool_calls
+    ↓
+ToolRegistry.dispatch(tool_name, args)
+    ↓
+找到对应的ToolEntry（不关心是内置/MCP/插件）
+    ↓
+┌─ 统一安全检查栈：
+│  ├─ check_fn → MCP检查是否连接，插件检查依赖
+│  ├─ 审批门 → 危险操作等用户确认
+│  └─ Tool Guardrails → 死循环检测
+    ↓
+调用 entry.handler(args)  ← 这里才分叉：
+   ├─ 内置工具 → 直接执行本地Python函数
+   ├─ MCP工具 → 封装成MCP JSON-RPC，发往子进程/HTTP
+   └─ 插件工具 → 执行插件Python函数
+    ↓
+统一结果后处理：
+   ├─ 异常捕获 → JSON错误格式
+   ├─ 不可信来源包装 <untrusted_tool_result>
+   ├─ 大结果持久化（超长输出存磁盘，返回预览）
+   └─ make_tool_result_message() → 统一role:tool消息
+    ↓
+加入对话历史，回到主agent继续推理
+```
+
+---
+
+### 为什么要统一汇入ToolRegistry？
+
+1. **对LLM透明**：模型只需要知道工具名和参数，不需要知道是本地还是远程
+2. **统一安全管控**：审批门、Guardrails、不可信包装、大结果持久化——所有工具过同样安全流程
+3. **统一动态schema**：所有工具都支持动态schema回调，MCP/插件工具也能享受
+4. **热插拔统一管理**：MCP重连、插件开关只需要register/deregister，_generation版本号自动失效缓存
+5. **统一错误处理**：所有异常统一捕获，不会因为某个来源工具挂了崩溃整个进程
+
+---
+
+### 自己写自定义工具最简单的方式
+
+在 `~/.hermes/plugins/my-custom-tool/` 下：
+
+**plugin.yaml**:
+```yaml
+name: my-custom-tool
+version: 1.0.0
+description: "My custom greet tool"
+provides_tools:
+  - my_greet
+```
+
+**__init__.py**:
+```python
+def register(ctx):
+    @ctx.register_tool(emoji="👋")
+    def my_greet(name: str) -> str:
+        """Greet someone by name.
+        
+        Args:
+            name: Person's name to greet
+        """
+        return f"Hello, {name}! 👋"
+```
+
+启用后重启Hermes，模型就能调用 `my_greet` 工具了。
+
+---
+
 ## 关键源码位置
 
 | 概念 | 文件位置 |
