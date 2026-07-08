@@ -570,3 +570,11 @@ agent._session_messages = messages
 | 工具并发执行与中断 | `agent/tool_executor.py` |
 | 中断后消息序列修复 | `agent/tool_dispatch_helpers.py` (close_interrupted_tool_sequence) |
 | 子代理中断传播 | `tools/delegate_tool.py` (interrupt_subagent) |
+| **迭代预算** | `agent/iteration_budget.py` |
+| **重试退避策略** | `agent/retry_utils.py` (adaptive_rate_limit_backoff, jittered_backoff) |
+| **重试状态跟踪** | `agent/turn_retry_state.py` (TurnRetryState) |
+| **Fallback管理器** | `agent/fallback_manager.py` (_try_activate_fallback, rewrite_prompt_model_identity) |
+| **消息卫生/清理** | `agent/` (_sanitize_api_messages, _sanitize_tool_call_arguments, _drop_thinking_only_and_merge_users) |
+| **上下文压缩器** | `agent/context_compressor.py` (_compress_context, should_compress) |
+| **可爱思考Spinner** | `agent/kawaii_spinner.py` (KawaiiSpinner) |
+| **增量会话持久化** | `run_agent.py` (_persist_session, _session_messages) |

@@ -13,6 +13,7 @@ learning-hermes/
 │   ├── 04-技能系统-Skills.md
 │   ├── 05-记忆系统-三层架构+编排器.md
 │   ├── 06-Turn回合机制.md
+│   ├── 07-架构选型-Tool-vs-Skill-vs-Subagent.md
 │   ├── 08-MCP协议支持.md
 │   ├── 09-异步后台-FireAndForget.md
 │   └── 10-PromptCaching前缀缓存.md
