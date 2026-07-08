@@ -661,5 +661,200 @@ executor.submit(safe_run)
 
 | 文件 | 职责 |
 |------|------|
-| [memory_manager.py](file:///e:/github/hermes-agent/agent/memory_manager.py#L618-L684) | **核心实现**：`_submit_background`、`_get_sync_executor`、`flush_pending`、`_drain_sync_executor`、`shutdown_all` |
-| [run_agent.py](file:///e:/github/hermes-agent/run_agent.py) | 调用点：turn结束时调用`sync_all`和`queue_prefetch_all` |
+| [memory_manager.py](file:///e:/github/hermes-agent/agent/memory_manager.py#L618-L684) | **记忆系统核心实现**：`_submit_background`、`_get_sync_executor`、`flush_pending`、`_drain_sync_executor`、`shutdown_all` |
+| [run_agent.py](file:///e:/github/hermes-agent/run_agent.py) | 记忆调用点：turn结束时调用`sync_all`和`queue_prefetch_all` |
+| [async_delegation.py](file:///e:/github/hermes-agent/tools/async_delegation.py) | **子agent后台委托实现**：`dispatch_async_delegation`、daemon线程池、完成事件队列 |
+| [process_registry.py](file:///e:/github/hermes-agent/tools/process_registry.py) | 后台进程管理：`completion_queue`完成事件总线 |
+| [terminal_tool.py](file:///e:/github/hermes-agent/tools/terminal_tool.py) | 终端命令后台运行：`background=true`参数 |
+
+---
+
+## 八、Fire-and-Forget 在Hermes中的其他使用场景
+
+Fire-and-Forget不只用在记忆同步！Hermes里至少有**4个核心场景**使用了这个模式。
+
+### 8.1 🔥 子agent后台委托（delegate_task background=true）——最典型的Fire-and-Forget
+
+**代码位置**：[async_delegation.py](file:///e:/github/hermes-agent/tools/async_delegation.py)
+
+这是Fire-and-Forget模式最典型的应用之一。当模型调用 `delegate_task(background=true)` 时：
+1. 主agent立即返回给用户一个"任务已后台启动"的提示
+2. 子agent在daemon线程池里独立运行自己完整的ReAct循环
+3. 用户可以立刻继续和主agent聊天，完全不阻塞
+4. 子agent完成后结果通过共享的`completion_queue`事件总线回流，作为新turn注入主会话
+
+#### 实现特点（和记忆系统对比）
+
+| 特性 | 记忆系统Fire-and-Forget | 子agent后台Fire-and-Forget |
+|------|------------------------|---------------------------|
+| 线程池 | `max_workers=1`单线程（保证顺序） | `max_workers=3`（默认，并发跑多个子agent） |
+| 线程类型 | 普通线程 | **Daemon线程**（_DaemonThreadPoolExecutor，进程退出自动终止） |
+| Future处理 | 直接丢弃 | 不返回future给主agent，但内部维护_records字典跟踪状态 |
+| 结果处理 | 只打日志，不通知用户 | 结果通过completion_queue事件总线回流，触发新turn通知用户 |
+| 容量控制 | 无上限（但单线程排队） | **硬容量限制**：默认最多3个同时运行，满了直接拒绝不排队 |
+| 失败处理 | fn内部catch，打debug日志 | worker catch所有异常，推送error状态事件 |
+| 中断支持 | 不支持 | 支持`/stop`中断所有运行中的后台子agent |
+
+#### 为什么子agent用daemon线程？
+
+代码注释原文：
+> Stdlib ThreadPoolExecutor workers are non-daemon. Background delegation is explicitly best-effort detached work, so a long child should be interruptible by /stop/shutdown but must not keep a CLI process alive after the user exits.
+
+- 普通线程（non-daemon）：进程退出时会等所有线程跑完才退出 → 如果用户退出时还有个跑了一半的子agent，进程会挂住关不掉
+- Daemon线程：进程退出时daemon线程自动终止，不阻塞退出 → 用户关了Hermes就立刻退出，后台任务直接终止
+
+#### 容量控制：为什么满了直接拒绝而不是排队？
+
+代码注释原文：
+> When at capacity the dispatch is REJECTED (the caller should fall back to sync or tell the user) rather than queued, so a runaway model can't pile up unbounded background work.
+
+如果排队，模型可能不停调用background=true，队列越积越多，后台跑几十上百个子agent浪费token——拒绝让模型知道"满了"，要么等要么同步跑，防止失控。
+
+#### 子agent后台的完整流程：
+
+```
+主agent收到用户消息
+  ↓
+模型决定："这个任务很重，后台跑吧"
+  ↓
+调用 delegate_task(goal="...", background=true)
+  ↓
+delegate_tool 调用 dispatch_async_delegation()
+  │
+  ├─ 检查容量：当前运行中<3？
+  │   └─ 满了 → 返回 rejected 错误，模型告诉用户稍后再试
+  │
+  ├─ 生成 delegation_id，记录到_records，状态=running
+  ├─ 拿到daemon线程池（max_workers=3）
+  ├─ executor.submit(_worker) → future直接丢弃！🔥 fire-and-forget
+  └─ 立即返回 {"status": "dispatched", "delegation_id": "..."}
+  ↓
+主agent（模型）看到dispatched → 回复用户："我已经开始在后台处理这个任务了，你可以先聊别的，完成后我会告诉你~"
+  ↓
+✅ 用户拿到回复，立刻可以继续聊天！
+  ↓
+[后台daemon线程]
+  _worker()运行：
+    ├─ 调用runner() → 构建子agent实例，运行完整对话循环
+    ├─ 子agent可能调用多个工具、多轮LLM调用，跑几秒到几分钟
+    └─ 不管成功失败，finally调用_finalize()
+         ↓
+       _push_completion_event() → 把结果放进process_registry.completion_queue
+  ↓
+CLI/Gateway的process_watcher在idle时轮询completion_queue
+  ↓
+检测到async_delegation事件
+  ↓
+合成一个系统/用户消息："[后台任务完成] 子agent搜索到了xx篇论文：..."
+  ↓
+作为全新turn注入主会话，Prefix Cache不被破坏（不修改历史，只加新消息）
+  ↓
+主agent新turn开始，告诉用户任务完成，展示结果
+```
+
+#### 和同步delegate的对比：
+
+| 模式 | 主agent阻塞？ | 用户等待？ | 结果回流 |
+|------|-------------|-----------|---------|
+| `background=false`（默认同步） | ✅ 阻塞，等子agent跑完 | ✅ 用户要等子agent全部跑完才能看到回复 | 工具结果直接返回，当前turn继续 |
+| `background=true`（后台） | ❌ 立即返回 | ❌ 用户拿到回复立刻可以继续 | 完成后作为新turn异步注入 |
+
+---
+
+### 8.2 🔧 终端命令后台运行（terminal background=true）
+
+**代码位置**：[terminal_tool.py](file:///e:/github/hermes-agent/tools/terminal_tool.py)、[process_registry.py](file:///e:/github/hermes-agent/tools/process_registry.py)
+
+当模型调用 `terminal_tool(command="npm run dev", background=true)` 时：
+- 立即返回一个session_id，不等待命令完成
+- 命令在后台运行（比如启动开发服务器、跑测试、build等长任务）
+- 配合 `notify_on_complete=true`：命令退出时自动发通知给用户（通过同一个completion_queue）
+- 可以用 `process(action="poll")` 查询状态，`process(action="kill")` 杀掉
+
+设计原则（代码注释原文）：
+> For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
+
+不让模型用 `nohup ... &` 这种shell后台方式，而是用Hermes自己的进程管理，这样：
+- Hermes能跟踪进程生命周期
+- 能正确捕获输出到日志
+- 退出时能清理所有后台进程
+- 完成时能通知用户
+- 不会产生孤儿进程
+
+---
+
+### 8.3 📊 MCP后台工具发现
+
+**代码位置**：[tui_gateway/entry.py#L300](file:///e:/github/hermes-agent/tui_gateway/entry.py#L300)
+
+Gateway启动时，MCP工具发现是后台执行的：
+```python
+# Fire-and-forget — don't block the loop waiting on itself.
+executor.submit(_background_mcp_discovery)
+```
+不阻塞Gateway启动，MCP连接、工具发现慢慢在后台做，连上了工具自动注册，没连上不影响主流程启动。
+
+---
+
+### 8.4 🔒 Tirith安全扫描后台安装
+
+**代码位置**：[tools/tirith_security.py#L571](file:///e:/github/hermes-agent/tools/tirith_security.py#L571)
+
+安全扫描组件的安装/更新也是fire-and-forget后台做：
+- 启动时后台检查更新、下载规则
+- 不阻塞主agent启动
+- 安装好了下次扫描自动用新版本
+- 安装失败了也不影响功能（降级为基础规则）
+
+---
+
+### 8.5 🖥️ Computer Use桥接调度
+
+**代码位置**：[tools/computer_use/cua_backend.py#L671](file:///e:/github/hermes-agent/tools/computer_use/cua_backend.py#L671)
+
+```python
+# Fire-and-forget schedule on the bridge loop. The future tracks...
+```
+计算机控制（GUI操作）的桥接事件调度也是fire-and-forget。
+
+---
+
+### 8.6 📈 TUI WebSocket消息发送
+
+**代码位置**：[tui_gateway/ws.py#L91](file:///e:/github/hermes-agent/tui_gateway/ws.py#L91)
+
+```python
+# Fire-and-forget — don't block the loop waiting on itself.
+```
+WebSocket广播消息给前端时，fire-and-forget发送，不阻塞事件循环等发送完成——某个客户端连接慢不会卡住整个Gateway。
+
+---
+
+## 九、所有场景对比总结
+
+| 使用场景 | 位置 | 线程池大小 | 线程类型 | 结果回流 | 容量限制 |
+|---------|------|-----------|---------|---------|---------|
+| **外部记忆sync/prefetch** | memory_manager | 1 | 普通线程 | 只打日志，不通知用户 | 无 |
+| **子agent后台委托** | async_delegation | 3（可配置） | Daemon线程 | completion_queue→新turn通知 | 硬限制，满了拒绝 |
+| **终端后台命令** | terminal_tool + process_registry | 随进程 | OS进程 | completion_queue通知 | 无硬限制 |
+| **MCP后台发现** | tui_gateway | - | - | 工具自动注册 | - |
+| **Tirith安全更新** | tirith_security | - | - | 静默更新 | - |
+| **Computer Use调度** | cua_backend | - | - | - | - |
+| **WebSocket广播** | tui_gateway/ws | 事件循环 | - | 静默丢弃失败 | - |
+
+---
+
+## 十、Fire-and-Forget模式的通用设计原则
+
+从Hermes这么多场景的应用中，可以总结出通用设计原则：
+
+1. **用户响应优先**：凡是用户不需要立刻知道结果的操作，全部fire-and-forget到后台，TTFT（首token延迟）是用户体验第一优先级
+2. **future直接丢弃**：真正的fire-and-forget就是不保留future，不等待、不回调——需要结果通知就走事件总线，不需要就只打日志
+3. **永不丢关键数据**：关键写入（比如记忆同步）要有降级路径，executor不可用时同步执行，慢但不能丢
+4. **异常隔离**：每个后台任务fn内部自己做try/except，一个任务失败不能杀掉worker线程，也不能影响其他任务
+5. **有界容量**：可能无限增长的场景（子agent后台、进程）必须有硬容量限制，满了拒绝不排队，防止资源失控
+6. **Daemon线程处理后台任务**：用户退出进程时，后台best-effort任务不能阻塞进程退出，用daemon线程自动终止
+7. **有界排空**：退出时给固定时间（比如5秒）让关键任务完成，超时就放弃，不能无限等待卡死退出
+8. **事件总线回流结果**：需要通知用户的结果（子agent完成、后台命令完成），通过共享事件队列统一处理，作为新消息注入而不是修改历史，保持消息角色交替合法和Prefix Cache完整
+9. **非关键操作静默失败**：遥测、日志、更新检查这些非关键操作失败了只打debug日志，不要告诉用户，不要影响主流程
+10. **顺序敏感用单线程**：需要保证顺序的场景（记忆写入）用max_workers=1单线程FIFO，天然保证顺序不需要加锁
