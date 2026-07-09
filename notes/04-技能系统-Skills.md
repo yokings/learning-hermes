@@ -480,6 +480,87 @@ Curator遵守4条不可违反的规则：
 
 ---
 
+### 伞状构建（Umbrella-Building）详解
+
+伞状构建是Curator阶段二LLM合并整理的核心机制——它解决的是**技能碎片化问题**。
+
+#### 问题背景：碎片化技能库的失败
+
+Agent每次解决一个新问题，如果都沉淀成一个独立窄技能，时间长了技能库会变成这样：
+
+```
+❌ 坏的技能库（碎片化）：
+hermes-config-port-error.md
+hermes-config-auth-fix.md
+hermes-dashboard-cors.md
+hermes-dashboard-websocket.md
+gateway-timeout-fix.md
+gateway-sse-bug.md
+ollama-connection-fix.md
+ollama-model-path.md
+...（几十上百个每个只解决一个具体小bug的窄技能）
+```
+
+这种库的问题：
+1. **污染索引**：System Prompt索引里塞几百个技能，浪费token
+2. **可发现性差**：模型靠描述匹配找技能，零散技能描述都是窄场景，很容易漏
+3. **重复冗余**：同一个领域的通用知识（配置文件位置、日志路径、排查流程）散落在多个文件里
+4. **维护困难**：改一个通用步骤要改N个技能
+
+代码里的提示词直接说：
+> "An collection of hundreds of narrow skills where each one captures one session's specific bug is a **FAILURE** of the library — not a feature."
+> —— [agent/curator.py#L370-L375](file:///e:/github/hermes-agent/agent/curator.py#L370-L375)
+
+#### 伞状构建的目标结构
+
+目标是**类级别（class-level）伞技能**：一个宽泛领域一个主伞技能，主SKILL.md讲通用工作流，具体窄场景作为带标签子小节或支持文件：
+
+```
+✅ 好的技能库（伞状结构）：
+hermes-configuration/              ← 伞技能
+├── SKILL.md                       ← 主文件：通用配置工作流、常见问题排查框架
+├── references/
+│   ├── port-issues.md             ← 原hermes-config-port-error降级
+│   ├── auth-troubleshooting.md    ← 原hermes-config-auth-fix降级
+│   └── provider-quirks.md         ← 原多个供应商坑点合并
+└── templates/
+    └── config-template.yaml
+
+hermes-dashboard/                  ← 另一个伞技能
+├── SKILL.md                       ← 通用启动/调试/排障流程
+└── references/
+    ├── cors-fix.md                ← 原cors窄技能
+    └── websocket-debug.md         ← 原websocket窄技能
+
+gateway/                           ← 又一个伞技能
+├── SKILL.md
+└── references/
+    ├── timeout-tuning.md
+    └── sse-troubleshooting.md
+```
+
+#### 三种合并方式
+
+Curator识别前缀簇（prefix clusters）后，对每个≥2个技能的簇，选择一种方式合并：
+
+| 方式 | 适用场景 | 操作 |
+|------|---------|------|
+| **a. 合并到已有伞技能** | 簇里已经有一个足够宽泛的技能（比如`pr-triage-salvage`覆盖PR审查整个领域） | `skill_manage patch`给现有伞技能加带标签小节吸收独有洞见，然后`skill_manage delete`归档窄技能兄弟 |
+| **b. 创建新伞技能** | 簇里都是窄技能，没有足够宽泛的 | `skill_manage create`创建新的class-level伞技能，主SKILL.md写通用工作流，吸收各窄技能内容，归档所有窄技能 |
+| **c. 降级为支持文件** | 窄技能内容太具体（会话特定复现步骤、API摘录、供应商坑点），不适合放主SKILL.md | `skill_manage write_file`把内容写到伞技能的`references/<topic>.md`（或templates/scripts），然后归档窄技能 |
+
+#### 关键设计原则
+
+1. **先找簇，后判断**：不是两两比较"这两个重复吗"，而是先按前缀/领域关键词聚类（hermes-config-*, gateway-*, mcp-*, pr-*, ollama-*...），再问一个更高层的问题："一个人类维护者会给这个类写一个技能，还是写N个？"答案是前者才合并。
+
+2. **包完整性优先**：移动技能时必须整体迁移——如果窄技能有自己的references/、templates/、scripts/，要么完整保留独立，要么整个搬到伞技能目录并重写相对路径，不能只把SKILL.md内容抽出来留下断链。
+
+3. **不按使用次数判断价值**：明确规则"不能因为use_count=0就跳过"——有些技能虽然只用过一次，但内容可能很有价值，要按内容重叠度判断，不是按使用频率。
+
+4. **合并结果可追溯**：每次合并在REPORT.md里给出明确的rename map：`old-name → new-name`，让用户一眼看到哪些技能被合并到哪个伞下了。
+
+---
+
 ### 为什么Curator设计成"空闲触发"而不是cron？
 
 1. **不抢资源**：用户正在用Agent的时候绝不跑后台整理，避免和主会话抢模型API配额、抢CPU、抢网络
