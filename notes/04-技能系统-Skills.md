@@ -68,29 +68,88 @@ Only proceed without loading a skill if genuinely none are relevant to the task.
 - 无关分类降级为"[names only]"——只列名字，不写描述，进一步压缩
 - 明确指示模型："只要相关就必须用skill_view加载"
 
-### 第2层：skill_view 按需加载完整内容
+### 第2层：skill_view 按需加载完整内容——"按需"到底是怎么实现的？
 
-模型看到索引后，如果判断某个技能和当前任务相关，调用 `skill_view(name="code-review")` 工具：
+模型看到索引后，如果判断某个技能和当前任务相关，**主动调用** `skill_view(name="code-review")` 工具——"按需"的核心就是：**模型自己决定什么时候加载、加载哪个，不是强制全部加载**。
+
+#### skill_view的工作流程（代码位置：[tools/skills_tool.py#L862-L1390](file:///e:/github/hermes-agent/tools/skills_tool.py#L862-L1390)）
 
 ```python
 @tool(emoji="📖")
-def skill_view(name: str) -> dict:
-    """Load a skill's full SKILL.md content into context.
-    Use this when a skill in the index appears relevant to the current task.
+def skill_view(name: str, file_path: str = None) -> str:
     """
-    skill_dir = find_skill_dir(name)
-    content = (skill_dir / "SKILL.md").read_text()
-    content = preprocess_skill_content(content, skill_dir)
+    Load a skill's content.
     
-    # 以user消息形式注入对话历史——不修改System Prompt！
-    return {
-        "output": f"[Loaded skill: {name}]\n\n{content}",
-        # 标记这是技能内容，让框架注入到正确位置
-        "_skill_injection": True,
-    }
+    Args:
+        name: Skill name (e.g. "code-review")
+        file_path: Optional specific support file to load (e.g. "references/python.md")
+    """
 ```
 
-**关键点**：技能内容以**user消息**注入，不是system消息——这样**不会破坏System Prompt前缀缓存**（第02篇讲的字节级缓存依然生效！）
+**"按需"体现在三个层面：**
+
+##### ① 时机按需：模型自己判断需要时才调用
+- System Prompt里的索引只放名字+一句话描述，非常轻量
+- 只有当模型判断"这个技能和当前任务相关"时，才会主动调用skill_view
+- 不相关的技能永远不会被加载进上下文，不占token
+- 明确指令："只要部分相关就必须加载，完全不相关才跳过"
+
+##### ② 内容按需：分两次渐进，先主文件再参考资料
+**第一次调用skill_view(name)——只加载SKILL.md主内容：**
+返回结构：
+```json
+{
+  "success": true,
+  "name": "code-review",
+  "content": "[Loaded skill: code-review]\n\n# Code Review SOP\n## 核心步骤\n1. 先跑测试...\n2. 检查安全问题...\n...",
+  "description": "代码审查规范与检查清单",
+  "linked_files": {
+    "references": ["security-checklist.md", "python.md", "typescript.md"],
+    "templates": ["pr-template.md"],
+    "scripts": ["run-lint.sh"]
+  },
+  "tags": ["code-quality", "review"],
+  "related_skills": ["debug", "test"],
+  "readiness_status": "available"
+}
+```
+- 主内容SKILL.md（通常500-2000字）先加载进来
+- **同时返回linked_files列表**，告诉模型这个技能还有哪些参考资料/模板/脚本
+- 模型看到linked_files后，如果当前任务需要Python特定的检查清单，**再调用第二次**
+
+**第二次调用skill_view(name, file_path)——只加载需要的支持文件：**
+```python
+skill_view(name="code-review", file_path="references/python.md")
+```
+只返回那一个参考文件的内容，不加载其他不相关的：
+```json
+{
+  "success": true,
+  "name": "code-review",
+  "file": "references/python.md",
+  "content": "# Python特定代码审查清单\n- 检查类型注解...\n- 检查异常处理...\n..."
+}
+```
+不需要的`typescript.md`、`security-checklist.md`不会进上下文。
+
+这就是为什么SKILL.md本身保持精简——主流程放主文件，语言特定细节/深入参考放references/，真正用哪个读哪个。
+
+##### ③ 粒度按需：file_path支持精确读取任意支持文件
+`file_path`参数可以指定技能目录下任意文件，路径安全检查防止`../`路径穿越：
+- 路径包含`..`直接拒绝
+- 解析后的真实路径必须在技能目录内，否则报错
+- 文件不存在时返回available_files列表，告诉模型有哪些文件可选
+- 二进制文件不读内容，只返回文件信息和大小
+
+返回结果以**user消息**注入对话历史——不是system消息，这样**不会破坏System Prompt前缀缓存**（第10篇讲的字节级缓存依然生效，加载技能不打断缓存命中）。
+
+```python
+# 关键点：技能内容以user消息注入，不动System Prompt
+return {
+    "output": f"[Loaded skill: {name}]\n\n{content}",
+    "_skill_injection": True,
+}
+```
 
 ### 第3层：references/ 支持目录（二次渐进）
 
